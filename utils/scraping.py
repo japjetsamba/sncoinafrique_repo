@@ -1,16 +1,18 @@
 
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+import os, shutil
 import time, random, re
 from typing import Optional, Tuple, List, Dict
+
 import requests
-from bs4 import BeautifulSoup as bs
+from bs4 import BeautifulSoup as bs, FeatureNotFound
 from urllib.parse import urljoin
 
 from .db import insert_raw_many
 
 # -----------------------------------------------------------------------------
-# Constantes et sélecteurs (inchangés)
+# Constantes et sélecteurs
 # -----------------------------------------------------------------------------
 SITE_BASE = 'https://sn.coinafrique.com'
 CATEGORIES = {
@@ -50,7 +52,118 @@ HEADERS = {
 }
 
 # -----------------------------------------------------------------------------
-# Utils
+# PURGE des caches wdm/selenium (utile en Cloud)
+# -----------------------------------------------------------------------------
+for p in [
+    os.path.expanduser("~/.wdm"),             # cache webdriver-manager
+    os.path.expanduser("~/.cache/selenium"),  # cache Selenium Manager
+]:
+    try:
+        if os.path.exists(p):
+            shutil.rmtree(p, ignore_errors=True)
+    except Exception:
+        pass
+
+# -----------------------------------------------------------------------------
+# Utils Selenium : drivers système (Chrome/Firefox)
+# -----------------------------------------------------------------------------
+def _find_chrome_binary() -> Optional[str]:
+    candidates = [
+        os.environ.get("CHROME_PATH"),
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+def _find_chromedriver() -> Optional[str]:
+    candidates = [
+        os.environ.get("CHROMEDRIVER_PATH"),
+        shutil.which("chromedriver"),
+        "/usr/bin/chromedriver",
+        "/usr/lib/chromium-browser/chromedriver",
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+def _find_geckodriver() -> Optional[str]:
+    candidates = [
+        os.environ.get("GECKODRIVER_PATH"),
+        shutil.which("geckodriver"),
+        "/usr/bin/geckodriver",
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+def create_driver(headless: bool = True):
+    """
+    Essaie Chrome (chromium + chromedriver système), sinon fallback Firefox (geckodriver).
+    Aucun webdriver-manager.
+    """
+    from selenium import webdriver
+
+    # --- Tentative Chrome/Chromium ---
+    try:
+        from selenium.webdriver.chrome.options import Options as ChromeOptions
+        from selenium.webdriver.chrome.service import Service as ChromeService
+
+        ch_bin = _find_chrome_binary()
+        ch_drv = _find_chromedriver()
+        if ch_drv:
+            options = ChromeOptions()
+            if headless:
+                try:
+                    options.add_argument("--headless=new")
+                except Exception:
+                    options.add_argument("--headless")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--disable-extensions")
+            options.add_argument("--window-size=1600,1200")
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument("--blink-settings=imagesEnabled=false")
+            options.add_argument(
+                "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+            )
+            if ch_bin:
+                options.binary_location = ch_bin
+            service = ChromeService(executable_path=ch_drv)
+            return webdriver.Chrome(service=service, options=options)
+    except Exception:
+        pass
+
+    # --- Fallback Firefox ---
+    from selenium.webdriver.firefox.options import Options as FirefoxOptions
+    from selenium.webdriver.firefox.service import Service as FirefoxService
+
+    gecko = _find_geckodriver()
+    if not gecko:
+        raise RuntimeError(
+            "Aucun driver système détecté. "
+            "Installe soit chromium+chromedriver, soit firefox-esr+geckodriver."
+        )
+    options = FirefoxOptions()
+    options.headless = headless
+    options.set_preference("general.useragent.override",
+                           "Mozilla/5.0 (X11; Linux x86_64; rv:115.0) Gecko/20100101 Firefox/115.0")
+    service = FirefoxService(executable_path=gecko)
+    return webdriver.Firefox(service=service, options=options)
+
+# -----------------------------------------------------------------------------
+# Utils Requests
 # -----------------------------------------------------------------------------
 def _norm_url(u: Optional[str]) -> Optional[str]:
     if not u:
@@ -67,7 +180,7 @@ def _requests_session_from_selenium_cookies(
     pool_maxsize: int = 50,
     verify: bool = True
 ) -> requests.Session:
-    """Session requests optimisée (pool HTTP) + cookies Selenium."""
+    """Session requests optimisée (pool HTTP) + cookies Selenium (compat urllib3 v1/v2)."""
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
 
@@ -75,12 +188,16 @@ def _requests_session_from_selenium_cookies(
     s.headers.update(HEADERS)
     s.verify = verify
 
-    # Pool + retries légers (évite surcoûts des connexions)
-    retry = Retry(
+    # Compat urllib3 v1/v2 pour allowed_methods/method_whitelist
+    retry_kwargs = dict(
         total=2, backoff_factor=0.2,
         status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(['GET', 'HEAD'])
     )
+    try:
+        retry = Retry(allowed_methods=frozenset(['GET', 'HEAD']), **retry_kwargs)
+    except TypeError:
+        retry = Retry(method_whitelist=frozenset(['GET', 'HEAD']), **retry_kwargs)
+
     adapter = HTTPAdapter(pool_connections=pool_connections, pool_maxsize=pool_maxsize, max_retries=retry)
     s.mount('http://', adapter)
     s.mount('https://', adapter)
@@ -91,8 +208,12 @@ def _requests_session_from_selenium_cookies(
     return s
 
 def _parse_detail_html(html: str, category: str) -> Dict[str, Optional[str]]:
-    """Extraction depuis la page DÉTAIL (mêmes sélecteurs que Selenium)."""
-    soup = bs(html, 'lxml')
+    """Extraction depuis la page DÉTAIL (fallback parser)"""
+    try:
+        soup = bs(html, 'lxml')
+    except FeatureNotFound:
+        soup = bs(html, 'html.parser')
+
     sel = DETAIL.get(category, {})
 
     def txt(css: str) -> Optional[str]:
@@ -122,7 +243,6 @@ def _parse_detail_html(html: str, category: str) -> Dict[str, Optional[str]]:
     if image_url and any(tok in image_url for tok in BAD_IMG_TOKENS):
         image_url = None
 
-    # fallback regex prix
     if not price_raw:
         m = PRICE.search(html or '')
         price_raw = m.group(1) if m else None
@@ -136,53 +256,37 @@ def _parse_detail_html(html: str, category: str) -> Dict[str, Optional[str]]:
 
 # -----------------------------------------------------------------------------
 # 💡 SCRAPER HYBRIDE ACCÉLÉRÉ
-#   - list_only=True  : extraction directe (Nom/Prix/Adresse/Image/Lien) côté LISTE via JS (ultra-rapide)
-#   - list_only=False : visite DÉTAIL concurrente avec requests+BS4 (max_workers threads)
+#   - list_only=True  : extraction LISTE (Nom/Prix/Adresse/Image/Lien) en JS (ultra-rapide)
+#   - list_only=False : visite DÉTAIL concurrente via requests+BS4 (max_workers threads)
 # -----------------------------------------------------------------------------
 def bs4_scrape_insert(
     category: str,
     start_page: int,
     end_page: int,
-    sleep: Tuple[float, float] = (0.02, 0.06),  # ⬅️ micro-sommeil par défaut
+    sleep: Tuple[float, float] = (0.12, 0.35),  # micro-pause (un peu augmentée)
     visit_detail: bool = True,
-    list_only: bool = True,       # ⬅️ ACTIVE ce mode pour la vitesse maximale
-    max_workers: int = 12,        # ⬅️ nb. threads pour les détails (si list_only=False)
+    list_only: bool = True,       # vitesse max par défaut
+    max_workers: int = 12,
     headless: bool = True,
-    verify_ssl: bool = True,      # True = vérif SSL requests (bonnes pratiques)
+    verify_ssl: bool = True,
     debug_dump: bool = False,
 ) -> int:
     """
     1) Selenium charge la PAGE LISTE.
-       - list_only=True  : on extrait Nom/Prix/Adresse/Image/Lien en JS → insertion directe (pas de détail).
-       - list_only=False : on récupère les LIENS + COOKIES → détails en parallèle via requests+BS4.
-    2) Insertion DB : mêmes colonnes que la version Selenium.
+       - list_only=True  : extrait Nom/Prix/Adresse/Image/Lien → insertion directe (pas de détail).
+       - list_only=False : récupère LIENS + COOKIES → détails en parallèle via requests+BS4.
+    2) Insertion DB : mêmes colonnes que la version Selenium (insert_raw_many).
     """
     assert category in CATEGORIES, f"Catégorie inconnue: {category}"
     total_inserted = 0
 
-    # -- Selenium pour charger la LISTE une seule fois par page
-    from selenium import webdriver
+    # -- Selenium pour charger la LISTE une fois par page
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
-    from selenium.webdriver.chrome.service import Service as ChromeService
-    from webdriver_manager.chrome import ChromeDriverManager
 
-    WAIT_SEC = 6
-    options = webdriver.ChromeOptions()
-    if headless:
-        options.add_argument('--headless=new')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--window-size=1600,1200')
-    options.add_argument('--disable-extensions')
-    # Bloquer images côté liste
-    try:
-        options.add_argument('--blink-settings=imagesEnabled=false')
-    except Exception:
-        pass
-
-    driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options)
+    WAIT_SEC = 8
+    driver = create_driver(headless=headless)
 
     def wait_list_ready():
         WebDriverWait(driver, WAIT_SEC).until(
@@ -191,8 +295,7 @@ def bs4_scrape_insert(
 
     try:
         for p in range(start_page, end_page + 1):
-            # 1) Ouvrir la page LISTE (2 schémas pagination)
-            links: List[str] = []
+            # 1) Ouvrir la page LISTE (2 schémas de pagination)
             page_ok = False
             for url in (
                 PAGE_PATTERNS[0].format(base=SITE_BASE, path=CATEGORIES[category], n=p),
@@ -206,11 +309,20 @@ def bs4_scrape_insert(
                 except Exception:
                     continue
             if not page_ok:
+                # tente sans pagination (utile pour p=1 si le site a changé)
+                try:
+                    driver.get(urljoin(SITE_BASE, CATEGORIES[category]))
+                    wait_list_ready()
+                    page_ok = True
+                except Exception:
+                    pass
+            if not page_ok:
+                # page inaccessible, on passe à la suivante
+                time.sleep(random.uniform(*sleep))
                 continue
 
             # 2A) MODE ULTRA-RAPIDE : extraction LISTE par JavaScript (une seule passe)
             if list_only:
-                # JS rapide qui lit toute la carte d’un coup (moins d’allers/retours Selenium)
                 js = """
                 const cards = Array.from(document.querySelectorAll('div.col.s6.m4.l3'));
                 function pickImg(el){
@@ -237,20 +349,16 @@ def bs4_scrape_insert(
                   return {name, price, addr, link, img};
                 });
                 """
-                items = driver.execute_script(js) or []
+                try:
+                    items = driver.execute_script(js) or []
+                except Exception:
+                    items = []
 
-                # Normaliser + filtrer images
                 rows_to_db: List[Dict] = []
                 for it in items:
-                    img = it.get('img')
-                    if img:
-                        if img.startswith('//'):
-                            img = 'https:' + img
-                        elif img.startswith('/'):
-                            img = urljoin(SITE_BASE, img)
-                        if any(t in img for t in BAD_IMG_TOKENS):
-                            img = None
-
+                    img = _norm_url(it.get('img') or None)
+                    if img and any(t in img for t in BAD_IMG_TOKENS):
+                        img = None
                     rows_to_db.append({
                         'source': 'coinafrique-sn',
                         'category': category,
@@ -261,10 +369,10 @@ def bs4_scrape_insert(
                         'link': it.get('link') or None,
                         'page': p,
                     })
+                if rows_to_db:
+                    inserted = insert_raw_many(rows_to_db)
+                    total_inserted += inserted
 
-                inserted = insert_raw_many(rows_to_db)
-                total_inserted += inserted
-                # micro-pause
                 time.sleep(random.uniform(*sleep))
                 continue  # page suivante
 
@@ -275,10 +383,9 @@ def bs4_scrape_insert(
                 href = a.get_attribute('href') or ''
                 if '/annonce/' in href:
                     raw_links.append(href)
-
-            # dédup
             links = list(dict.fromkeys(raw_links))
             if not links:
+                time.sleep(random.uniform(*sleep))
                 continue
 
             # Session requests avec cookies Selenium
@@ -289,13 +396,16 @@ def bs4_scrape_insert(
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
             def fetch_detail(href: str) -> Dict[str, Optional[str]]:
-                # session par thread (évite les effets de bord)
                 s = requests.Session()
                 s.headers.update(HEADERS)
                 s.verify = verify_ssl
-                # copier les cookies
                 for c in rs.cookies:
-                    s.cookies.set(c.name, c.value, domain=c.domain or 'sn.coinafrique.com')
+                    # c peut être un Cookie morsel ou objet Cookie, on sécurise l'accès
+                    name = getattr(c, 'name', None) or getattr(c, 'key', None)
+                    value = getattr(c, 'value', None)
+                    domain = getattr(c, 'domain', None) or 'sn.coinafrique.com'
+                    if name and value:
+                        s.cookies.set(name, value, domain=domain)
                 try:
                     r = s.get(href, timeout=12)
                     r.raise_for_status()
@@ -326,8 +436,9 @@ def bs4_scrape_insert(
                         'page': p,
                     })
 
-            inserted = insert_raw_many(rows_to_db)
-            total_inserted += inserted
+            if rows_to_db:
+                inserted = insert_raw_many(rows_to_db)
+                total_inserted += inserted
             time.sleep(random.uniform(*sleep))
 
     finally:
@@ -338,5 +449,5 @@ def bs4_scrape_insert(
 
     return total_inserted
 
-# Compatibilité : si l'app appelle encore l'ancien nom
+# Compat : alias
 selenium_scrape_insert = bs4_scrape_insert
