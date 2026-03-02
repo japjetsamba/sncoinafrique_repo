@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import utils.scraping as scraping
+import utils.scraping_bs as scraping
 import utils.db as dbutils
 import utils.cleaning as cleaning
 import utils.charts as charts
