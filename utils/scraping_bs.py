@@ -1,8 +1,12 @@
 
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import os, shutil
-import time, random, re
+
+import os
+import shutil
+import time
+import random
+import re
 from typing import Optional, Tuple, List, Dict
 from urllib.parse import urljoin
 
@@ -139,8 +143,10 @@ def _requests_session_from_selenium_cookies(
         status_forcelist=(429, 500, 502, 503, 504),
     )
     try:
+        # urllib3 v2
         retry = Retry(allowed_methods=frozenset(['GET', 'HEAD']), **retry_kwargs)
     except TypeError:
+        # urllib3 v1
         retry = Retry(method_whitelist=frozenset(['GET', 'HEAD']), **retry_kwargs)
 
     adapter = HTTPAdapter(pool_connections=pool_connections, pool_maxsize=pool_maxsize, max_retries=retry)
@@ -148,8 +154,12 @@ def _requests_session_from_selenium_cookies(
     s.mount('https://', adapter)
 
     for c in cookies:
+        # les cookies Selenium peuvent être des dicts simples
+        name = c.get('name')
+        value = c.get('value')
         domain = c.get('domain') or 'sn.coinafrique.com'
-        s.cookies.set(c['name'], c['value'], domain=domain)
+        if name and value:
+            s.cookies.set(name, value, domain=domain)
     return s
 
 def _parse_detail_html(html: str, category: str) -> Dict[str, Optional[str]]:
@@ -223,6 +233,10 @@ def ensure_table_sqlite(conn, table: str = "annonces"):
     conn.commit()
 
 def save_df_to_sqlite(df: pd.DataFrame, db_path: str = "coinafrique.db", table: str = "annonces") -> tuple[int, int]:
+    """
+    Sauvegarde le DataFrame dans SQLite avec INSERT OR IGNORE sur l'unicité de 'link'.
+    Retourne (inserted, total_rows_in_df).
+    """
     if df is None or df.empty:
         return (0, 0)
     import sqlite3
@@ -234,10 +248,13 @@ def save_df_to_sqlite(df: pd.DataFrame, db_path: str = "coinafrique.db", table: 
         cols = ['source','category','title','price_raw','address_raw','image_url','link','page']
         rows = []
         for _, r in df[cols].fillna("").iterrows():
+            try:
+                page_val = int(r['page'])
+            except Exception:
+                page_val = 0
             rows.append((
                 r['source'], r['category'], r['title'], r['price_raw'],
-                r['address_raw'], r['image_url'], r['link'],
-                int(r['page']) if str(r['page']).isdigit() else 0
+                r['address_raw'], r['image_url'], r['link'], page_val
             ))
         conn.executemany(
             f"INSERT OR IGNORE INTO {table} "
@@ -315,14 +332,14 @@ def scrape_category_to_df(
 
             # ---- Mode LISTE ultra-rapide (JS) ----
             if list_only:
-                js = """
+                js = r"""
                 const cards = Array.from(document.querySelectorAll('div.col.s6.m4.l3'));
                 function pickImg(el){
                   const img = el.querySelector('img.ad__card-img') || el.querySelector('a.card-image img');
                   if(!img) {
                     const a = el.querySelector('a.card-image');
                     if(a && a.style && a.style.backgroundImage){
-                      const m = a.style.backgroundImage.match(/url\\(['"]?(.*?)['"]?\\)/);
+                      const m = a.style.backgroundImage.match(/url\(['"]?(.*?)['"]?\)/);
                       return m ? m[1] : null;
                     }
                     return null;
@@ -387,12 +404,16 @@ def scrape_category_to_df(
                 s = requests.Session()
                 s.headers.update(HEADERS)
                 s.verify = verify_ssl
+                # copier les cookies (compat objets cookiejar et dicts)
                 for c in rs.cookies:
-                    name = getattr(c, 'name', None) or getattr(c, 'key', None)
-                    value = getattr(c, 'value', None)
-                    domain = getattr(c, 'domain', None) or 'sn.coinafrique.com'
-                    if name and value:
-                        s.cookies.set(name, value, domain=domain)
+                    try:
+                        name = getattr(c, 'name', None) or getattr(c, 'key', None)
+                        value = getattr(c, 'value', None)
+                        domain = getattr(c, 'domain', None) or 'sn.coinafrique.com'
+                        if name and value:
+                            s.cookies.set(name, value, domain=domain)
+                    except Exception:
+                        pass
                 try:
                     r = s.get(href, timeout=12)
                     r.raise_for_status()
@@ -436,6 +457,51 @@ def scrape_category_to_df(
     if not df.empty and 'link' in df.columns:
         df = df.drop_duplicates(subset=['link']).reset_index(drop=True)
     return df
+
+# -----------------------------------------------------------------------------
+# Wrapper rétro-compatible : bs4_scrape_insert (attendu par l'app)
+# -----------------------------------------------------------------------------
+def bs4_scrape_insert(
+    category: str,
+    start_page: int,
+    end_page: int,
+    sleep: Tuple[float, float] = (0.12, 0.35),
+    visit_detail: bool = True,
+    list_only: bool = True,
+    max_workers: int = 12,
+    headless: bool = True,
+    verify_ssl: bool = True,
+    db_path: str = "coinafrique.db",
+    table: str = "annonces",
+) -> int:
+    """
+    Exécute le scraping (DataFrame) puis enregistre dans SQLite.
+    Retourne le nombre de lignes insérées (INSERT OR IGNORE).
+    """
+    df = scrape_category_to_df(
+        category=category,
+        start_page=start_page,
+        end_page=end_page,
+        list_only=list_only,
+        visit_detail=visit_detail,
+        max_workers=max_workers,
+        sleep=sleep,
+        headless=headless,
+        verify_ssl=verify_ssl,
+    )
+    inserted, _total = save_df_to_sqlite(df, db_path=db_path, table=table)
+    return inserted
+
+# Ancien alias (si d'autres parties de l'app l'utilisent encore)
+selenium_scrape_insert = bs4_scrape_insert
+
+# Pour import explicite
+__all__ = [
+    "scrape_category_to_df",
+    "save_df_to_sqlite",
+    "bs4_scrape_insert",
+    "selenium_scrape_insert",
+]
 
 # -----------------------------------------------------------------------------
 # Exemple d’usage direct (à commenter si utilisé comme module)
