@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import utils.scraping_bs as scraping
 import utils.cleaning as cleaning
 import utils.charts as charts
-# On n'utilise plus utils.db ici pour l'affichage, pour éviter tout décalage de chemin
+# On évite d'utiliser utils.db ici pour l'affichage pour rester agnostique du chemin
 # import utils.db as dbutils
 
 # -----------------------------------------------------------------------------
@@ -37,8 +37,12 @@ if css_path.exists():
 DB_PATH  = st.secrets.get("DB_PATH", os.environ.get("DB_PATH", "coinafrique.db"))
 DB_TABLE = st.secrets.get("DB_TABLE", os.environ.get("DB_TABLE", "annonces"))
 
-# Affichage d'un rappel discret des paramètres DB (utile en Cloud)
-st.sidebar.caption(f"💾 DB: `{DB_PATH}` · Table: `{DB_TABLE}`")
+# Flag DEBUG (ne rien afficher par défaut pour l'utilisateur final)
+DEBUG = str(st.secrets.get("DEBUG", os.environ.get("DEBUG", "0"))).strip() in ("1", "true", "True", "YES", "yes")
+
+# Affichage d'un rappel des paramètres DB (uniquement en mode DEBUG)
+if DEBUG:
+    st.sidebar.caption(f"💾 DB: `{DB_PATH}` · Table: `{DB_TABLE}`")
 
 # -----------------------------------------------------------------------------
 # Constantes & répertoires
@@ -79,7 +83,7 @@ def load_db(db_path: str = DB_PATH, table: str = DB_TABLE, category: str | None 
             return pd.DataFrame()
 
         if category:
-            # category provient d'une liste fermée (sélecteur), pas d'injection ici
+            # category provient d'une liste fermée (sélecteur)
             q = f"SELECT * FROM {table} WHERE category = ? ORDER BY id DESC LIMIT ?;"
             df = pd.read_sql_query(q, conn, params=(category, int(limit)))
         else:
@@ -193,11 +197,11 @@ def show_scraper():
                     category=category,
                     start_page=1,
                     end_page=int(pages),
-                    list_only=True,      # ultra-rapide; bascule à False pour visiter les détails
-                    visit_detail=False,   # ignoré si list_only=True
+                    list_only=True,       # ultra-rapide; bascule à False pour visiter les détails
+                    visit_detail=False,    # ignoré si list_only=True
                     headless=True,
-                    db_path=DB_PATH,      # ✅ même DB que l’affichage
-                    table=DB_TABLE,       # ✅ même table que l’affichage
+                    db_path=DB_PATH,       # ✅ même DB que l’affichage
+                    table=DB_TABLE,        # ✅ même table que l’affichage
                 )
                 st.success(f"Terminé — {inserted} nouvelles lignes insérées (INSERT OR IGNORE).")
             except Exception as e:
@@ -213,16 +217,17 @@ def show_scraper():
                 st.info(f"La base est vide ou introuvable à ce chemin : `{DB_PATH}`.")
             else:
                 st.info("La table est vide ou n'a pas encore été créée dans la DB.")
-                # Liste des tables disponibles (diagnostic)
-                try:
-                    with sqlite3.connect(str(db_file)) as conn:
-                        tables = conn.execute(
-                            "SELECT name FROM sqlite_master WHERE type='table';"
-                        ).fetchall()
-                    if tables:
-                        st.caption("Tables présentes : " + ", ".join(t[0] for t in tables))
-                except Exception:
-                    pass
+                # (En DEBUG uniquement) lister les tables disponibles
+                if DEBUG:
+                    try:
+                        with sqlite3.connect(str(db_file)) as conn:
+                            tables = conn.execute(
+                                "SELECT name FROM sqlite_master WHERE type='table';"
+                            ).fetchall()
+                        if tables:
+                            st.caption("Tables présentes : " + ", ".join(t[0] for t in tables))
+                    except Exception:
+                        pass
         else:
             df_disp = harmonize_columns_for_display(df_db, category)
             st.success(f"{len(df_disp)} lignes chargées depuis `{DB_TABLE}` (catégorie: {category}).")
@@ -341,14 +346,15 @@ elif menu == 'Feedback':
     show_feedback()
 
 # -----------------------------------------------------------------------------
-# (Optionnel) Diagnostic rapide pour Streamlit Cloud
+# (Optionnel) Diagnostic rapide pour Streamlit Cloud - seulement en DEBUG
 # -----------------------------------------------------------------------------
-with st.expander("🛠️ Diagnostic (optionnel)"):
-    st.caption(f"cwd: {os.getcwd()}")
-    try:
-        st.caption("Fichiers dans le répertoire courant :")
-        st.code("\n".join(os.listdir(".")))
-    except Exception:
-        pass
-    st.caption(f"DB_PATH utilisé: {DB_PATH}")
-    st.caption(f"DB_TABLE utilisée: {DB_TABLE}")
+if DEBUG:
+    with st.expander("🛠️ Diagnostic (optionnel)"):
+        st.caption(f"cwd: {os.getcwd()}")
+        try:
+            st.caption("Fichiers dans le répertoire courant :")
+            st.code("\n".join(os.listdir(".")))
+        except Exception:
+            pass
+        st.caption(f"DB_PATH utilisé: {DB_PATH}")
+        st.caption(f"DB_TABLE utilisée: {DB_TABLE}")
